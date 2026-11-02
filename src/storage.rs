@@ -209,4 +209,168 @@ impl Bitcask {
 
         Ok(())
     }
+
+
+    pub fn get(&mut self, key: &[u8]) -> io::Result<Option<Vec<u8>>> {
+        let pointer = match self.keydir.get(key) {
+            Some(pointer) => *pointer,
+            None => return Ok(None),
+        };
+
+        let value_len = pointer.val_len as usize;
+        let mut value = vec![0u8; value_len];
+
+        self.file.seek(SeekFrom::Start(pointer.offset))?;
+        self.file.read_exact(&mut value)?;
+
+        Ok(Some(value))
+    }
+
+    pub fn delete(&mut self, key: &[u8], timestamp: u64) -> io::Result<()> {
+        let encoded = encode_record(key, None, timestamp)?;
+
+        let new_write_offset = self
+            .write_offset
+            .checked_add(encoded.len() as u64)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "file offset overflow",
+                )
+            })?;
+
+        let original_offset = self.write_offset;
+
+        self.file.seek(SeekFrom::Start(original_offset))?;
+
+        if let Err(write_error) = self.file.write_all(&encoded) {
+            if let Err(rollback_error) = self.file.set_len(original_offset) {
+                return Err(io::Error::new(
+                    rollback_error.kind(),
+                    format!(
+                        "tombstone write failed: {write_error}; \
+                         rollback failed: {rollback_error}"
+                    ),
+                ));
+            }
+
+            return Err(write_error);
+        }
+
+        self.keydir.remove(key);
+        self.write_offset = new_write_offset;
+
+        Ok(())
+    }
+
+    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(path)?;
+
+        let file_len = file.seek(SeekFrom::End(0))?;
+        file.seek(SeekFrom::Start(0))?;
+
+        let mut keydir = HashMap::new();
+        let mut current_offset = 0u64;
+
+        while current_offset < file_len {
+            let mut header_buf = [0u8; HEADER_SIZE];
+
+            match file.read_exact(&mut header_buf) {
+                Ok(()) => {}
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    break;
+                }
+                Err(e) => return Err(e),
+            }
+
+            let (crc, timestamp, key_len, val_len) =
+                decode_header(&header_buf)?;
+
+            let value_len = if val_len == TOMBSTONE {
+                0usize
+            } else {
+                val_len as usize
+            };
+
+            let record_len = HEADER_SIZE
+                .checked_add(key_len as usize)
+                .and_then(|n| n.checked_add(value_len))
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "record length overflow",
+                    )
+                })?;
+
+            let remaining = file_len - current_offset;
+
+            if record_len as u64 > remaining {
+                break;
+            }
+
+            let mut record_buf = Vec::new();
+
+            record_buf.try_reserve_exact(record_len).map_err(|e| {
+                io::Error::new(
+                    io::ErrorKind::OutOfMemory,
+                    format!("failed to allocate record buffer: {e}"),
+                )
+            })?;
+
+            record_buf.extend_from_slice(&header_buf);
+
+            let payload_len = record_len - HEADER_SIZE;
+            record_buf.resize(record_len, 0);
+
+            if let Err(e) = file.read_exact(&mut record_buf[HEADER_SIZE..]) {
+                if e.kind() == io::ErrorKind::UnexpectedEof {
+                    break;
+                }
+                return Err(e);
+            }
+
+            verify_record(&record_buf)?;
+
+            let key_start = HEADER_SIZE;
+            let key_end = key_start + key_len as usize;
+            let key = record_buf[key_start..key_end].to_vec();
+
+            if val_len == TOMBSTONE {
+                keydir.remove(&key);
+            } else {
+                let value_offset = current_offset
+                    + HEADER_SIZE as u64
+                    + key_len as u64;
+
+                keydir.insert(
+                    key,
+                    LogPointer {
+                        offset: value_offset,
+                        val_len,
+                        timestamp,
+                    },
+                );
+            }
+
+            current_offset += record_len as u64;
+        }
+
+        if current_offset < file_len {
+            file.set_len(current_offset)?;
+        }
+
+        file.seek(SeekFrom::End(0))?;
+
+        Ok(Self {
+            file,
+            write_offset: current_offset,
+            keydir,
+        })
+    }
+
 }
