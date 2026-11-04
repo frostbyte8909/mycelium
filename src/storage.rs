@@ -1,7 +1,7 @@
 
 use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
-use std::io::{self, Seek, SeekFrom, Write};
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 pub const HEADER_SIZE: usize = 20;
@@ -136,23 +136,6 @@ pub struct Bitcask {
 }
 
 impl Bitcask {
-    pub fn open(path: impl AsRef<Path>) -> io::Result<Self> {
-        let mut file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(path)?;
-
-        let file_len = file.seek(SeekFrom::End(0))?;
-
-        Ok(Self {
-            file,
-            write_offset: file_len,
-            keydir: HashMap::new(),
-        })
-    }
-
     pub fn put(
         &mut self,
         key: &[u8],
@@ -288,7 +271,7 @@ impl Bitcask {
                 Err(e) => return Err(e),
             }
 
-            let (crc, timestamp, key_len, val_len) =
+            let (_crc, timestamp, key_len, val_len) =
                 decode_header(&header_buf)?;
 
             let value_len = if val_len == TOMBSTONE {
@@ -324,7 +307,6 @@ impl Bitcask {
 
             record_buf.extend_from_slice(&header_buf);
 
-            let payload_len = record_len - HEADER_SIZE;
             record_buf.resize(record_len, 0);
 
             if let Err(e) = file.read_exact(&mut record_buf[HEADER_SIZE..]) {
