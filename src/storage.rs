@@ -316,7 +316,9 @@ impl Bitcask {
                 return Err(e);
             }
 
-            verify_record(&record_buf)?;
+            if verify_record(&record_buf).is_err() {
+                break;
+            }
 
             let key_start = HEADER_SIZE;
             let key_end = key_start + key_len as usize;

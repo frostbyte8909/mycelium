@@ -35,8 +35,8 @@ impl DbActor {
         Self { receiver, store }
     }
 
-    pub async fn run(mut self) {
-        while let Some(cmd) = self.receiver.recv().await {
+    pub fn run(mut self) {
+        while let Some(cmd) = self.receiver.blocking_recv() {
             match cmd {
                 DbCommand::Get { key, responder } => {
                     let result = self.store.get(&key);
